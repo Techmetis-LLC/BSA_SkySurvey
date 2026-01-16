@@ -1,1621 +1,829 @@
 #!/usr/bin/env python3
+"""
+Astronomical Object Detection System
+Detects moving objects (asteroids, comets) in astronomical image sequences
+by identifying objects that don't follow stellar motion patterns.
+"""
 
 import argparse
 import logging
 import os
 import sys
 import time
-import json
-import struct
-import zlib
+import warnings
 from pathlib import Path
-from dataclasses import dataclass, field, asdict
-from typing import List, Tuple, Dict, Optional, Any, Callable
-from datetime import datetime
+from typing import List, Tuple, Dict, Optional, Any
+import json
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
 
 import numpy as np
-from numpy.typing import NDArray
-import requests
-
-# Astronomy libraries
+import matplotlib.pyplot as plt
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
 from astropy import units as u
 from astropy.time import Time
+from astropy.table import Table
 from astropy.stats import sigma_clipped_stats
+import astropy.visualization as vis
 from astroquery.jplhorizons import Horizons
 from astroquery.mpc import MPC
-
-# Image processing
 import sep
+from photutils.detection import DAOStarFinder
+from photutils.aperture import CircularAperture
 from skimage import io as skio
 from skimage.registration import phase_cross_correlation
-from skimage.transform import warp, AffineTransform
 from sklearn.cluster import DBSCAN
 import cv2
-from PIL import Image
-
-# Progress indication
 from tqdm import tqdm
 
-# Configure module logger
+# Suppress specific warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='astropy.wcs')
+warnings.filterwarnings('ignore', message='.*datfix.*')
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# Data Classes
-# =============================================================================
-
-@dataclass
-class ImageMetadata:
-    """Metadata extracted from astronomical images."""
-    filepath: Path
-    width: int
-    height: int
-    observation_time: Optional[datetime] = None
-    exposure_time: Optional[float] = None
-    filter_name: Optional[str] = None
-    telescope: Optional[str] = None
-    observer: Optional[str] = None
-    ra_center: Optional[float] = None
-    dec_center: Optional[float] = None
-    pixel_scale: Optional[float] = None
-    wcs: Optional[WCS] = None
-    header: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class DetectedSource:
-    """A detected source in an image."""
-    x: float
-    y: float
-    flux: float
-    snr: float
-    fwhm: float
-    ellipticity: float
-    ra: Optional[float] = None
-    dec: Optional[float] = None
-    magnitude: Optional[float] = None
-
-
-@dataclass  
-class MovingObject:
-    """A detected moving object across multiple frames."""
-    id: str
-    positions: List[Tuple[float, float]]
-    times: List[datetime]
-    ra_positions: List[float]
-    dec_positions: List[float]
-    velocity_arcsec_per_hour: float
-    position_angle: float
-    confidence: float
-    matched_name: Optional[str] = None
-    matched_designation: Optional[str] = None
-    is_known: bool = False
-    orbital_elements: Optional[Dict] = None
-
-
-@dataclass
-class DetectionResult:
-    """Complete detection result for an image sequence."""
-    input_files: List[str]
-    processing_time: float
-    sources_per_image: List[int]
-    moving_objects: List[MovingObject]
-    potential_discoveries: List[MovingObject]
-    known_objects: List[MovingObject]
-    errors: List[str]
-    warnings: List[str]
-
-
-# =============================================================================
-# Progress Tracking
-# =============================================================================
-
-class ProgressTracker:
-    """Thread-safe progress tracking with multiple output modes."""
-    
-    def __init__(self, total: int, description: str = "", 
-                 mode: str = "tqdm", callback: Optional[Callable] = None):
-        self.total = total
-        self.current = 0
-        self.description = description
-        self.mode = mode
-        self.callback = callback
-        self._pbar = None
-        
-        if mode == "tqdm":
-            self._pbar = tqdm(total=total, desc=description, unit="step")
-    
-    def update(self, n: int = 1, status: str = ""):
-        """Update progress by n steps."""
-        self.current += n
-        
-        if self.mode == "tqdm" and self._pbar:
-            self._pbar.update(n)
-            if status:
-                self._pbar.set_postfix_str(status)
-        elif self.mode == "log":
-            pct = (self.current / self.total) * 100
-            logger.info(f"[{pct:.1f}%] {self.description}: {status}")
-        elif self.mode == "callback" and self.callback:
-            self.callback(self.current, self.total, status)
-    
-    def close(self):
-        if self._pbar:
-            self._pbar.close()
-
-
-@contextmanager
-def progress_context(total: int, description: str, mode: str = "tqdm"):
-    """Context manager for progress tracking."""
-    tracker = ProgressTracker(total, description, mode)
-    try:
-        yield tracker
-    finally:
-        tracker.close()
-
-
-# =============================================================================
-# Image Processing
-# =============================================================================
-
-class XISFReader:
-    """Reader for XISF (Extensible Image Serialization Format) files."""
-    
-    SIGNATURE = b'XISF0100'
-    
-    @classmethod
-    def read(cls, filepath: Path) -> Tuple[NDArray, Dict[str, Any]]:
-        """Read an XISF file and return image data and metadata."""
-        with open(filepath, 'rb') as f:
-            # Read and validate signature
-            sig = f.read(8)
-            if sig != cls.SIGNATURE:
-                raise ValueError(f"Invalid XISF signature: {sig}")
-            
-            # Read header length
-            header_len = struct.unpack('<I', f.read(4))[0]
-            reserved = f.read(4)  # Reserved bytes
-            
-            # Read XML header
-            header_xml = f.read(header_len).decode('utf-8')
-            
-            # Parse XML to extract image properties
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(header_xml)
-            
-            # Find image element
-            ns = {'xisf': 'http://www.pixinsight.com/xisf'}
-            image_elem = root.find('.//xisf:Image', ns)
-            if image_elem is None:
-                # Try without namespace
-                image_elem = root.find('.//Image')
-            
-            if image_elem is None:
-                raise ValueError("No Image element found in XISF header")
-            
-            # Extract geometry
-            geometry = image_elem.get('geometry', '').split(':')
-            if len(geometry) >= 2:
-                width, height = int(geometry[0]), int(geometry[1])
-                channels = int(geometry[2]) if len(geometry) > 2 else 1
-            else:
-                raise ValueError("Invalid geometry in XISF")
-            
-            # Get data type
-            sample_format = image_elem.get('sampleFormat', 'Float32')
-            dtype_map = {
-                'UInt8': np.uint8,
-                'UInt16': np.uint16,
-                'UInt32': np.uint32,
-                'Float32': np.float32,
-                'Float64': np.float64
-            }
-            dtype = dtype_map.get(sample_format, np.float32)
-            
-            # Get data location
-            location = image_elem.get('location', '')
-            parts = location.split(':')
-            
-            if parts[0] == 'attachment':
-                # Data is attached after header
-                offset = int(parts[1]) if len(parts) > 1 else 0
-                size = int(parts[2]) if len(parts) > 2 else None
-                
-                f.seek(16 + header_len + offset)
-                
-                if size:
-                    raw_data = f.read(size)
-                else:
-                    raw_data = f.read()
-                
-                # Check for compression
-                compression = image_elem.get('compression', '')
-                if compression.startswith('zlib'):
-                    raw_data = zlib.decompress(raw_data)
-                
-                # Convert to numpy array
-                data = np.frombuffer(raw_data, dtype=dtype)
-                
-                if channels > 1:
-                    data = data.reshape((channels, height, width))
-                    # Convert to grayscale if color
-                    if channels == 3:
-                        data = np.mean(data, axis=0)
-                    else:
-                        data = data[0]
-                else:
-                    data = data.reshape((height, width))
-                
-            else:
-                raise ValueError(f"Unsupported XISF location type: {parts[0]}")
-            
-            # Extract metadata
-            metadata = {
-                'width': width,
-                'height': height,
-                'sample_format': sample_format
-            }
-            
-            # Parse FITS keywords if present
-            for prop in root.findall('.//xisf:FITSKeyword', ns) + root.findall('.//FITSKeyword'):
-                name = prop.get('name', '')
-                value = prop.get('value', '')
-                metadata[name] = value
-            
-            return data.astype(np.float32), metadata
 
 
 class ImageProcessor:
     """Handles loading and preprocessing of astronomical images."""
     
-    SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.tiff', '.tif', '.fits', '.fit', '.fts', '.xisf'}
-    
     def __init__(self, debug: bool = False):
         self.debug = debug
+        self.supported_formats = ['.jpg', '.jpeg', '.tiff', '.tif', '.fits', '.fit', '.xisf']
     
-    def load_image(self, filepath: Path) -> Tuple[NDArray, ImageMetadata]:
+    def load_image(self, filepath: Path) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Load an astronomical image and extract metadata."""
         filepath = Path(filepath)
         suffix = filepath.suffix.lower()
         
-        if suffix not in self.SUPPORTED_FORMATS:
-            raise ValueError(f"Unsupported format: {suffix}. Supported: {self.SUPPORTED_FORMATS}")
+        if suffix not in self.supported_formats:
+            raise ValueError(f"Unsupported format: {suffix}")
         
-        if suffix in {'.fits', '.fit', '.fts'}:
-            return self._load_fits(filepath)
-        elif suffix == '.xisf':
-            return self._load_xisf(filepath)
-        elif suffix in {'.tiff', '.tif'}:
-            return self._load_tiff(filepath)
-        else:  # JPEG
-            return self._load_jpeg(filepath)
-    
-    def _load_fits(self, filepath: Path) -> Tuple[NDArray, ImageMetadata]:
-        """Load a FITS file."""
-        with fits.open(filepath) as hdul:
-            # Find the image HDU
-            for hdu in hdul:
-                if hdu.data is not None and hdu.data.ndim >= 2:
-                    data = hdu.data.astype(np.float32)
-                    header = dict(hdu.header)
-                    break
+        metadata = {'filepath': str(filepath), 'format': suffix}
+        
+        try:
+            if suffix in ['.fits', '.fit']:
+                return self._load_fits(filepath, metadata)
+            elif suffix == '.xisf':
+                return self._load_xisf(filepath, metadata)
             else:
-                raise ValueError("No image data found in FITS file")
-            
-            # Handle 3D data (color or cube)
-            if data.ndim == 3:
-                if data.shape[0] == 3:  # RGB
-                    data = np.mean(data, axis=0)
-                else:
-                    data = data[0]
+                return self._load_standard_image(filepath, metadata)
+        except Exception as e:
+            logger.error(f"Failed to load {filepath}: {e}")
+            raise
+    
+    def _load_fits(self, filepath: Path, metadata: Dict) -> Tuple[np.ndarray, Dict]:
+        """Load FITS image."""
+        with fits.open(filepath) as hdul:
+            data = hdul[0].data.astype(np.float64)
+            header = hdul[0].header
             
             # Extract WCS if present
             try:
-                wcs = WCS(hdu.header)
-                if not wcs.has_celestial:
-                    wcs = None
-            except Exception:
-                wcs = None
+                wcs = WCS(header)
+                metadata['wcs'] = wcs
+            except:
+                logger.warning(f"Could not extract WCS from {filepath}")
+                metadata['wcs'] = None
             
-            # Parse observation time
-            obs_time = None
-            for key in ['DATE-OBS', 'DATE_OBS', 'MJD-OBS']:
-                if key in header:
+            # Extract observation time
+            for time_key in ['DATE-OBS', 'DATE', 'MJD-OBS']:
+                if time_key in header:
                     try:
-                        if key == 'MJD-OBS':
-                            obs_time = Time(header[key], format='mjd').datetime
-                        else:
-                            obs_time = Time(header[key], format='isot').datetime
+                        metadata['obs_time'] = Time(header[time_key])
                         break
-                    except Exception:
+                    except:
                         continue
             
-            metadata = ImageMetadata(
-                filepath=filepath,
-                width=data.shape[1],
-                height=data.shape[0],
-                observation_time=obs_time,
-                exposure_time=header.get('EXPTIME') or header.get('EXPOSURE'),
-                filter_name=header.get('FILTER'),
-                telescope=header.get('TELESCOP'),
-                observer=header.get('OBSERVER'),
-                ra_center=header.get('CRVAL1'),
-                dec_center=header.get('CRVAL2'),
-                pixel_scale=header.get('CDELT1') or header.get('PIXSCALE'),
-                wcs=wcs,
-                header=header
-            )
+            metadata['header'] = dict(header)
             
+        return data, metadata
+    
+    def _load_xisf(self, filepath: Path, metadata: Dict) -> Tuple[np.ndarray, Dict]:
+        """Load XISF image (requires xisf library)."""
+        try:
+            import xisf
+            xisf_file = xisf.XISF(filepath)
+            data = xisf_file.read_image(0).astype(np.float64)
+            metadata['xisf_metadata'] = xisf_file.get_metadata()
             return data, metadata
+        except ImportError:
+            raise ImportError("xisf library required for XISF support. Install with: pip install xisf")
     
-    def _load_xisf(self, filepath: Path) -> Tuple[NDArray, ImageMetadata]:
-        """Load an XISF file."""
-        data, xisf_meta = XISFReader.read(filepath)
+    def _load_standard_image(self, filepath: Path, metadata: Dict) -> Tuple[np.ndarray, Dict]:
+        """Load standard image formats (JPG, TIFF)."""
+        data = skio.imread(filepath)
         
-        # Parse observation time from FITS keywords
-        obs_time = None
-        for key in ['DATE-OBS', 'DATE_OBS']:
-            if key in xisf_meta:
-                try:
-                    obs_time = Time(xisf_meta[key], format='isot').datetime
-                    break
-                except Exception:
-                    continue
+        # Convert to grayscale if needed
+        if len(data.shape) == 3:
+            data = np.mean(data, axis=2)
         
-        metadata = ImageMetadata(
-            filepath=filepath,
-            width=data.shape[1],
-            height=data.shape[0],
-            observation_time=obs_time,
-            exposure_time=float(xisf_meta.get('EXPTIME', 0)) or None,
-            filter_name=xisf_meta.get('FILTER'),
-            telescope=xisf_meta.get('TELESCOP'),
-            header=xisf_meta
-        )
-        
-        return data, metadata
+        return data.astype(np.float64), metadata
     
-    def _load_tiff(self, filepath: Path) -> Tuple[NDArray, ImageMetadata]:
-        """Load a TIFF file."""
-        data = skio.imread(str(filepath))
+    def preprocess_image(self, data: np.ndarray, metadata: Dict) -> np.ndarray:
+        """Apply preprocessing to image data."""
+        # Basic preprocessing
+        processed = data.copy()
         
-        # Convert to grayscale if color
-        if data.ndim == 3:
-            if data.shape[2] == 3:
-                data = np.mean(data, axis=2)
-            elif data.shape[2] == 4:  # RGBA
-                data = np.mean(data[:, :, :3], axis=2)
+        # Remove hot pixels and cosmic rays
+        processed = self._remove_cosmic_rays(processed)
         
-        data = data.astype(np.float32)
+        # Background subtraction
+        processed = self._subtract_background(processed)
         
-        metadata = ImageMetadata(
-            filepath=filepath,
-            width=data.shape[1],
-            height=data.shape[0]
-        )
+        if self.debug:
+            logger.debug(f"Image preprocessed: shape={processed.shape}, "
+                        f"min={processed.min():.2f}, max={processed.max():.2f}")
         
-        return data, metadata
+        return processed
     
-    def _load_jpeg(self, filepath: Path) -> Tuple[NDArray, ImageMetadata]:
-        """Load a JPEG file."""
-        img = Image.open(filepath)
-        data = np.array(img.convert('L'), dtype=np.float32)
+    def _remove_cosmic_rays(self, data: np.ndarray) -> np.ndarray:
+        """Simple cosmic ray removal using median filtering."""
+        from scipy import ndimage
+        median_filtered = ndimage.median_filter(data, size=3)
+        diff = np.abs(data - median_filtered)
+        threshold = 5 * np.std(diff)
+        cosmic_rays = diff > threshold
         
-        metadata = ImageMetadata(
-            filepath=filepath,
-            width=data.shape[1],
-            height=data.shape[0]
-        )
-        
-        return data, metadata
-    
-    def preprocess(self, data: NDArray, 
-                   subtract_background: bool = True,
-                   remove_hot_pixels: bool = True) -> NDArray:
-        """Preprocess image data for detection."""
         result = data.copy()
-        
-        # Ensure proper byte order for SEP
-        if not result.flags['C_CONTIGUOUS']:
-            result = np.ascontiguousarray(result)
-        
-        # Remove hot pixels using median filter
-        if remove_hot_pixels:
-            from scipy.ndimage import median_filter
-            filtered = median_filter(result, size=3)
-            # Only replace extreme outliers
-            threshold = np.std(result) * 5
-            mask = np.abs(result - filtered) > threshold
-            result[mask] = filtered[mask]
-        
-        # Background subtraction using SEP
-        if subtract_background:
-            try:
-                bkg = sep.Background(result.byteswap().newbyteorder())
-                result = result - bkg.back()
-            except Exception as e:
-                logger.warning(f"SEP background subtraction failed: {e}, using simple method")
-                result = result - np.median(result)
+        result[cosmic_rays] = median_filtered[cosmic_rays]
         
         return result
+    
+    def _subtract_background(self, data: np.ndarray) -> np.ndarray:
+        """Subtract background using SEP - NumPy 2.0 compatible."""
+        try:
+            # Ensure data is in correct byte order and type
+            data_copy = np.ascontiguousarray(data, dtype=np.float64)
+            
+            # For NumPy 2.0+ compatibility, ensure native byte order
+            if data_copy.dtype.byteorder not in ('=', '|'):
+                # Convert to native byte order
+                data_copy = data_copy.astype(data_copy.dtype.newbyteorder('='))
+            
+            bkg = sep.Background(data_copy)
+            return data - bkg.back()
+        except Exception as e:
+            logger.warning(f"SEP background subtraction failed: {e}, using simple method")
+            # Fallback to simple background subtraction
+            from scipy import ndimage
+            background = ndimage.gaussian_filter(data, sigma=50)
+            return data - background
 
-
-# =============================================================================
-# Star Detection
-# =============================================================================
 
 class StarDetector:
-    """Detects stellar sources in astronomical images."""
+    """Detects and measures stars in astronomical images."""
     
     def __init__(self, debug: bool = False):
         self.debug = debug
     
-    def detect(self, data: NDArray, threshold: float = 3.0,
-               min_area: int = 5, deblend: bool = True) -> List[DetectedSource]:
-        """Detect sources in the image using SEP."""
+    def detect_stars(self, data: np.ndarray, threshold: float = 5.0) -> Table:
+        """Detect stars in the image."""
         try:
-            # Ensure proper format for SEP
-            data_sep = data.byteswap().newbyteorder()
+            # Ensure data is in correct format for SEP
+            data_copy = np.ascontiguousarray(data, dtype=np.float64)
             
-            # Background estimation
-            bkg = sep.Background(data_sep)
-            data_sub = data - bkg.back()
+            # For NumPy 2.0+ compatibility
+            if data_copy.dtype.byteorder not in ('=', '|'):
+                data_copy = data_copy.astype(data_copy.dtype.newbyteorder('='))
             
-            # Source extraction
-            objects = sep.extract(
-                data_sub.byteswap().newbyteorder(),
-                threshold,
-                err=bkg.globalrms,
-                minarea=min_area,
-                deblend_cont=0.005 if deblend else 1.0,
-                deblend_nthresh=32 if deblend else 1
-            )
+            # Use SEP for source detection
+            bkg = sep.Background(data_copy)
+            bkg_subtracted = data_copy - bkg.back()
             
-            if self.debug:
-                logger.debug(f"SEP extracted {len(objects)} raw objects")
+            objects = sep.extract(bkg_subtracted, threshold * bkg.globalrms)
             
-            # Convert to DetectedSource objects
-            sources = []
-            for obj in objects:
-                # Calculate FWHM from semi-axes
-                fwhm = 2.35 * np.sqrt((obj['a']**2 + obj['b']**2) / 2)
-                
-                # Calculate ellipticity
-                if obj['a'] > 0:
-                    ellipticity = 1 - obj['b'] / obj['a']
-                else:
-                    ellipticity = 0
-                
-                # Calculate SNR
-                snr = obj['flux'] / (bkg.globalrms * np.sqrt(obj['npix']))
-                
-                source = DetectedSource(
-                    x=float(obj['x']),
-                    y=float(obj['y']),
-                    flux=float(obj['flux']),
-                    snr=float(snr),
-                    fwhm=float(fwhm),
-                    ellipticity=float(ellipticity)
-                )
-                sources.append(source)
+            # Convert to astropy Table
+            sources = Table()
+            sources['x'] = objects['x']
+            sources['y'] = objects['y']
+            sources['flux'] = objects['flux']
+            sources['a'] = objects['a']  # semi-major axis
+            sources['b'] = objects['b']  # semi-minor axis
+            sources['theta'] = objects['theta']
+            sources['flag'] = objects['flag']
             
-            # Filter sources
-            sources = self._filter_sources(sources, data.shape)
+            # Calculate signal-to-noise ratio
+            sources['snr'] = sources['flux'] / np.sqrt(sources['flux'] + bkg.globalrms**2)
+            
+            # Filter out likely non-stellar objects
+            sources = self._filter_stellar_objects(sources, data.shape)
             
             if self.debug:
-                logger.debug(f"After filtering: {len(sources)} sources")
+                logger.debug(f"Detected {len(sources)} stellar objects")
             
             return sources
             
         except Exception as e:
-            logger.error(f"SEP detection failed: {e}")
-            return self._fallback_detection(data, threshold)
+            logger.error(f"Star detection failed: {e}")
+            # Fallback to DAOStarFinder
+            return self._fallback_star_detection(data, threshold)
     
-    def _filter_sources(self, sources: List[DetectedSource], 
-                        shape: Tuple[int, int]) -> List[DetectedSource]:
-        """Filter detected sources to remove artifacts."""
-        height, width = shape
-        edge_buffer = 20
-        
-        filtered = []
-        for src in sources:
-            # Skip edge sources
-            if src.x < edge_buffer or src.x > width - edge_buffer:
-                continue
-            if src.y < edge_buffer or src.y > height - edge_buffer:
-                continue
-            
-            # Skip very elongated objects (likely cosmic rays or satellites)
-            if src.ellipticity > 0.7:
-                continue
-            
-            # Skip very faint sources
-            if src.snr < 5:
-                continue
-            
-            # Skip sources with unrealistic FWHM
-            if src.fwhm < 1 or src.fwhm > 50:
-                continue
-            
-            filtered.append(src)
-        
-        return filtered
-    
-    def _fallback_detection(self, data: NDArray, threshold: float) -> List[DetectedSource]:
-        """Fallback detection using simple peak finding."""
-        from scipy.ndimage import maximum_filter, label
-        
+    def _fallback_star_detection(self, data: np.ndarray, threshold: float) -> Table:
+        """Fallback star detection using photutils."""
         mean, median, std = sigma_clipped_stats(data, sigma=3.0)
-        threshold_val = median + threshold * std
+        daofind = DAOStarFinder(fwhm=3.0, threshold=threshold * std)
+        sources = daofind(data - median)
         
-        # Find local maxima
-        local_max = maximum_filter(data, size=5) == data
-        peaks = (data > threshold_val) & local_max
+        if sources is None:
+            return Table()
         
-        labeled, num_features = label(peaks)
-        
-        sources = []
-        for i in range(1, num_features + 1):
-            y_coords, x_coords = np.where(labeled == i)
-            if len(x_coords) == 0:
-                continue
-            
-            x = float(np.mean(x_coords))
-            y = float(np.mean(y_coords))
-            flux = float(data[int(y), int(x)])
-            snr = float((flux - median) / std)
-            
-            sources.append(DetectedSource(
-                x=x, y=y, flux=flux, snr=snr, fwhm=3.0, ellipticity=0.0
-            ))
-        
+        sources['snr'] = sources['peak'] / std
         return sources
-
-
-# =============================================================================
-# Image Registration
-# =============================================================================
-
-class ImageRegistrar:
-    """Aligns images to a common reference frame."""
     
-    def __init__(self, debug: bool = False):
-        self.debug = debug
-    
-    def compute_shift(self, reference: NDArray, target: NDArray) -> Tuple[float, float]:
-        """Compute shift between two images using cross-correlation."""
-        # Use phase cross-correlation for sub-pixel accuracy
-        shift, error, diffphase = phase_cross_correlation(
-            reference, target, upsample_factor=10
-        )
+    def _filter_stellar_objects(self, sources: Table, image_shape: Tuple) -> Table:
+        """Filter to keep only stellar-like objects."""
+        if len(sources) == 0:
+            return sources
         
-        if self.debug:
-            logger.debug(f"Computed shift: dy={shift[0]:.2f}, dx={shift[1]:.2f}")
+        # Remove flagged objects
+        mask = sources['flag'] == 0
         
-        return float(shift[1]), float(shift[0])  # Return as (dx, dy)
-    
-    def compute_transform(self, ref_sources: List[DetectedSource],
-                          target_sources: List[DetectedSource],
-                          max_dist: float = 10.0) -> Optional[AffineTransform]:
-        """Compute affine transform by matching sources."""
-        if len(ref_sources) < 3 or len(target_sources) < 3:
-            return None
+        # Remove objects that are too elongated (likely galaxies or artifacts)
+        ellipticity = 1 - sources['b'] / (sources['a'] + 1e-10)  # Avoid division by zero
+        mask &= ellipticity < 0.5
         
-        # Extract positions
-        ref_pos = np.array([(s.x, s.y) for s in ref_sources])
-        tgt_pos = np.array([(s.x, s.y) for s in target_sources])
+        # Remove very faint objects
+        mask &= sources['snr'] > 10
         
-        # Match sources using triangles (simplified approach)
-        # Build KD-tree for fast nearest neighbor lookup
-        from scipy.spatial import cKDTree
+        # Remove objects near image edges
+        height, width = image_shape
+        edge_buffer = 50
+        mask &= (sources['x'] > edge_buffer) & (sources['x'] < width - edge_buffer)
+        mask &= (sources['y'] > edge_buffer) & (sources['y'] < height - edge_buffer)
         
-        # Use brightest sources for matching
-        ref_sorted = sorted(ref_sources, key=lambda s: s.flux, reverse=True)[:50]
-        tgt_sorted = sorted(target_sources, key=lambda s: s.flux, reverse=True)[:50]
-        
-        ref_pos = np.array([(s.x, s.y) for s in ref_sorted])
-        tgt_pos = np.array([(s.x, s.y) for s in tgt_sorted])
-        
-        # Initial shift estimate from cross-correlation
-        # (would need image data, so skip for now)
-        
-        # Try to find matching pairs
-        tree = cKDTree(tgt_pos)
-        
-        matched_ref = []
-        matched_tgt = []
-        
-        for i, pos in enumerate(ref_pos):
-            dist, idx = tree.query(pos, k=1)
-            if dist < max_dist:
-                matched_ref.append(pos)
-                matched_tgt.append(tgt_pos[idx])
-        
-        if len(matched_ref) < 3:
-            return None
-        
-        matched_ref = np.array(matched_ref)
-        matched_tgt = np.array(matched_tgt)
-        
-        # Estimate affine transform using RANSAC
-        from skimage.measure import ransac
-        
-        try:
-            model, inliers = ransac(
-                (matched_tgt, matched_ref),
-                AffineTransform,
-                min_samples=3,
-                residual_threshold=2,
-                max_trials=1000
-            )
-            
-            if self.debug:
-                logger.debug(f"Transform found with {np.sum(inliers)} inliers")
-            
-            return model
-        except Exception as e:
-            logger.warning(f"Transform estimation failed: {e}")
-            return None
-    
-    def align_image(self, image: NDArray, transform: AffineTransform) -> NDArray:
-        """Apply transform to align image."""
-        aligned = warp(image, transform.inverse, preserve_range=True)
-        return aligned.astype(np.float32)
+        return sources[mask]
 
-
-# =============================================================================
-# Motion Detection
-# =============================================================================
 
 class MotionDetector:
     """Detects objects with motion different from stellar motion."""
     
     def __init__(self, debug: bool = False):
         self.debug = debug
-        self.min_detections = 3  # Minimum frames to confirm detection
+        self.reference_stars = None
+        self.transformation_matrix = None
     
-    def detect_motion(self, images: List[NDArray],
-                      sources_list: List[List[DetectedSource]],
-                      times: List[datetime],
-                      stellar_shift: Optional[Tuple[float, float]] = None
-                     ) -> List[MovingObject]:
-        """Detect objects moving differently from stars."""
-        
-        if len(images) < 2:
+    def register_images(self, image_data: List[Tuple[np.ndarray, Table, Dict]]) -> List[np.ndarray]:
+        """Register images to a common reference frame."""
+        if len(image_data) < 2:
             raise ValueError("Need at least 2 images for motion detection")
         
-        # Step 1: Compute expected stellar motion between frames
-        registrar = ImageRegistrar(debug=self.debug)
-        stellar_shifts = []
+        reference_data, reference_sources, _ = image_data[0]
+        registered_images = [reference_data]
         
-        for i in range(1, len(images)):
-            dx, dy = registrar.compute_shift(images[0], images[i])
-            stellar_shifts.append((dx, dy))
+        # Use brightest stars as reference points
+        if len(reference_sources) > 0:
+            n_stars = min(50, len(reference_sources))
+            ref_stars = reference_sources[np.argsort(reference_sources['flux'])[-n_stars:]]
+            self.reference_stars = np.column_stack([ref_stars['x'], ref_stars['y']])
+        else:
+            logger.warning("No reference stars found in first image")
+            self.reference_stars = np.array([])
         
-        if self.debug:
-            logger.debug(f"Stellar shifts: {stellar_shifts}")
-        
-        # Step 2: Find sources that don't follow stellar motion
-        candidates = self._find_non_stellar_motion(
-            sources_list, stellar_shifts, times
-        )
-        
-        if self.debug:
-            logger.debug(f"Found {len(candidates)} motion candidates")
-        
-        # Step 3: Link detections across frames
-        moving_objects = self._link_detections(candidates, times)
-        
-        # Step 4: Filter false positives
-        moving_objects = self._filter_false_positives(moving_objects)
-        
-        return moving_objects
-    
-    def _find_non_stellar_motion(self, sources_list: List[List[DetectedSource]],
-                                  stellar_shifts: List[Tuple[float, float]],
-                                  times: List[datetime]
-                                 ) -> List[Dict]:
-        """Find sources that don't match stellar motion."""
-        candidates = []
-        
-        # Use first frame as reference
-        ref_sources = sources_list[0]
-        
-        for frame_idx in range(1, len(sources_list)):
-            dx_stellar, dy_stellar = stellar_shifts[frame_idx - 1]
-            curr_sources = sources_list[frame_idx]
+        for i, (data, sources, metadata) in enumerate(image_data[1:], 1):
+            if self.debug:
+                logger.debug(f"Registering image {i+1}/{len(image_data)}")
             
-            # Predict where each reference source should be
-            for ref_src in ref_sources:
-                predicted_x = ref_src.x + dx_stellar
-                predicted_y = ref_src.y + dy_stellar
+            # Find corresponding stars
+            if len(sources) > 0 and len(self.reference_stars) > 0:
+                n_stars = min(50, len(sources))
+                curr_stars = sources[np.argsort(sources['flux'])[-n_stars:]]
+                curr_positions = np.column_stack([curr_stars['x'], curr_stars['y']])
                 
-                # Find closest match in current frame
-                best_match = None
-                best_dist = float('inf')
+                # Calculate transformation
+                transform = self._calculate_transformation(self.reference_stars, curr_positions)
                 
-                for curr_src in curr_sources:
-                    dist = np.sqrt((curr_src.x - predicted_x)**2 + 
-                                   (curr_src.y - predicted_y)**2)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_match = curr_src
-                
-                # If no good match, this source moved differently
-                if best_dist > 5.0:  # More than 5 pixels from prediction
-                    # Look for the actual match (non-stellar motion)
-                    for curr_src in curr_sources:
-                        dist_from_ref = np.sqrt((curr_src.x - ref_src.x)**2 + 
-                                                (curr_src.y - ref_src.y)**2)
-                        # Must have moved, but not too far
-                        if 2.0 < dist_from_ref < 200.0:
-                            candidates.append({
-                                'frame': frame_idx,
-                                'ref_pos': (ref_src.x, ref_src.y),
-                                'curr_pos': (curr_src.x, curr_src.y),
-                                'flux': curr_src.flux,
-                                'time': times[frame_idx]
-                            })
+                # Apply transformation
+                registered = self._apply_transformation(data, transform)
+                registered_images.append(registered)
+            else:
+                logger.warning(f"Insufficient stars for registration in image {i+1}")
+                registered_images.append(data)
         
-        return candidates
+        return registered_images
     
-    def _link_detections(self, candidates: List[Dict],
-                         times: List[datetime]) -> List[MovingObject]:
-        """Link detections across frames into tracklets."""
-        if not candidates:
-            return []
+    def _calculate_transformation(self, ref_points: np.ndarray, curr_points: np.ndarray) -> np.ndarray:
+        """Calculate transformation matrix between point sets."""
+        # Simple translation-based registration
+        from scipy.spatial.distance import cdist
         
-        # Extract positions for clustering
-        positions = np.array([c['curr_pos'] for c in candidates])
+        distances = cdist(ref_points, curr_points)
+        matches = []
         
-        if len(positions) < 2:
-            return []
+        for i in range(min(len(ref_points), len(curr_points), 10)):
+            ref_idx, curr_idx = np.unravel_index(distances.argmin(), distances.shape)
+            matches.append((ref_points[ref_idx], curr_points[curr_idx]))
+            distances[ref_idx, :] = np.inf
+            distances[:, curr_idx] = np.inf
         
-        # Use DBSCAN to cluster nearby detections
-        clustering = DBSCAN(eps=20, min_samples=2).fit(positions)
+        if len(matches) < 3:
+            return np.eye(3)  # Identity matrix if not enough matches
         
+        # Calculate average translation
+        ref_matched = np.array([m[0] for m in matches])
+        curr_matched = np.array([m[1] for m in matches])
+        
+        translation = np.mean(ref_matched - curr_matched, axis=0)
+        
+        # Create transformation matrix
+        transform = np.eye(3)
+        transform[0:2, 2] = translation
+        
+        return transform
+    
+    def _apply_transformation(self, image: np.ndarray, transform: np.ndarray) -> np.ndarray:
+        """Apply transformation to image."""
+        # Extract translation for simple case
+        translation = transform[0:2, 2]
+        
+        # Use OpenCV for image translation
+        M = np.float32([[1, 0, translation[0]], [0, 1, translation[1]]])
+        registered = cv2.warpAffine(image.astype(np.float32), M, 
+                                   (image.shape[1], image.shape[0]), 
+                                   flags=cv2.INTER_LINEAR)
+        
+        return registered.astype(np.float64)
+    
+    def detect_moving_objects(self, registered_images: List[np.ndarray], 
+                            source_tables: List[Table]) -> List[Dict]:
+        """Detect objects that move between images."""
         moving_objects = []
-        unique_labels = set(clustering.labels_)
         
-        for label in unique_labels:
-            if label == -1:  # Noise
-                continue
+        if len(registered_images) < 2:
+            return moving_objects
+        
+        # Create difference images
+        diff_images = []
+        for i in range(1, len(registered_images)):
+            diff = registered_images[i] - registered_images[0]
+            diff_images.append(diff)
+        
+        # Detect sources in difference images
+        for i, diff_img in enumerate(diff_images):
+            # Smooth difference image to reduce noise
+            from scipy import ndimage
+            smoothed_diff = ndimage.gaussian_filter(np.abs(diff_img), sigma=1.0)
             
-            mask = clustering.labels_ == label
-            cluster_candidates = [c for c, m in zip(candidates, mask) if m]
+            # Find peaks in difference image
+            threshold = 3 * np.std(smoothed_diff)
+            peaks = self._find_peaks(smoothed_diff, threshold)
             
-            if len(cluster_candidates) < self.min_detections:
-                continue
-            
-            # Sort by frame number
-            cluster_candidates.sort(key=lambda c: c['frame'])
-            
-            # Calculate motion parameters
-            positions_list = [c['curr_pos'] for c in cluster_candidates]
-            times_list = [c['time'] for c in cluster_candidates]
-            
-            # Calculate velocity
-            if len(times_list) >= 2:
-                dt = (times_list[-1] - times_list[0]).total_seconds() / 3600.0  # hours
-                if dt > 0:
-                    dx = positions_list[-1][0] - positions_list[0][0]
-                    dy = positions_list[-1][1] - positions_list[0][1]
-                    
-                    # Assume ~1 arcsec/pixel (should use actual plate scale)
-                    velocity = np.sqrt(dx**2 + dy**2) / dt
-                    angle = np.degrees(np.arctan2(dy, dx))
-                    
-                    # Calculate confidence based on number of detections and consistency
-                    confidence = min(1.0, len(cluster_candidates) / 5.0)
-                    
-                    obj = MovingObject(
-                        id=f"obj_{len(moving_objects):04d}",
-                        positions=positions_list,
-                        times=times_list,
-                        ra_positions=[],
-                        dec_positions=[],
-                        velocity_arcsec_per_hour=velocity,
-                        position_angle=angle,
-                        confidence=confidence
-                    )
+            for peak in peaks:
+                x, y = peak
+                
+                # Verify this isn't a known star
+                if not self._is_known_star(x, y, source_tables[0]):
+                    obj = {
+                        'x': x,
+                        'y': y,
+                        'image_pair': (0, i + 1),
+                        'flux_diff': diff_img[int(y), int(x)],
+                        'detection_time': i
+                    }
                     moving_objects.append(obj)
         
+        # Cluster detections that might be the same object
+        if moving_objects:
+            moving_objects = self._cluster_detections(moving_objects)
+        
+        if self.debug:
+            logger.debug(f"Found {len(moving_objects)} potential moving objects")
+        
         return moving_objects
     
-    def _filter_false_positives(self, objects: List[MovingObject]) -> List[MovingObject]:
-        """Filter out likely false positive detections."""
-        filtered = []
+    def _find_peaks(self, image: np.ndarray, threshold: float) -> List[Tuple[float, float]]:
+        """Find peaks in image above threshold."""
+        from scipy.ndimage import maximum_filter
+        from scipy.ndimage import binary_erosion
         
-        for obj in objects:
-            # Skip if too few detections
-            if len(obj.positions) < self.min_detections:
-                continue
-            
-            # Skip if motion is too fast (likely satellite or cosmic ray)
-            if obj.velocity_arcsec_per_hour > 1000:  # arcsec/hour
-                if self.debug:
-                    logger.debug(f"Filtering {obj.id}: velocity too high")
-                continue
-            
-            # Skip if motion is too slow (likely star or noise)
-            if obj.velocity_arcsec_per_hour < 0.5:
-                if self.debug:
-                    logger.debug(f"Filtering {obj.id}: velocity too low")
-                continue
-            
-            # Check for linear motion (asteroids move linearly over short times)
-            if not self._is_linear_motion(obj.positions):
-                if self.debug:
-                    logger.debug(f"Filtering {obj.id}: non-linear motion")
-                continue
-            
-            filtered.append(obj)
+        # Find local maxima
+        local_maxima = maximum_filter(image, size=5) == image
+        background = image < threshold
+        eroded_background = binary_erosion(background, structure=np.ones((3, 3)))
+        detected_peaks = local_maxima ^ eroded_background
         
-        return filtered
+        # Get peak coordinates
+        y_coords, x_coords = np.where(detected_peaks)
+        peaks = list(zip(x_coords.astype(float), y_coords.astype(float)))
+        
+        return peaks
     
-    def _is_linear_motion(self, positions: List[Tuple[float, float]], 
-                          tolerance: float = 3.0) -> bool:
-        """Check if positions follow approximately linear motion."""
-        if len(positions) < 3:
-            return True
+    def _is_known_star(self, x: float, y: float, star_catalog: Table, tolerance: float = 5.0) -> bool:
+        """Check if position corresponds to a known star."""
+        if len(star_catalog) == 0:
+            return False
         
-        # Fit a line to positions
-        x = np.array([p[0] for p in positions])
-        y = np.array([p[1] for p in positions])
+        distances = np.sqrt((star_catalog['x'] - x)**2 + (star_catalog['y'] - y)**2)
+        return np.any(distances < tolerance)
+    
+    def _cluster_detections(self, detections: List[Dict]) -> List[Dict]:
+        """Cluster detections that likely belong to the same object."""
+        if len(detections) < 2:
+            return detections
         
-        # Linear regression
-        coeffs = np.polyfit(x, y, 1)
-        y_fit = np.polyval(coeffs, x)
+        # Prepare data for clustering
+        positions = np.array([[det['x'], det['y']] for det in detections])
         
-        # Calculate residuals
-        residuals = np.abs(y - y_fit)
+        # Use DBSCAN to cluster nearby detections
+        clustering = DBSCAN(eps=10, min_samples=1).fit(positions)
+        labels = clustering.labels_
         
-        return np.max(residuals) < tolerance
+        # Group detections by cluster
+        clustered_objects = []
+        for label in set(labels):
+            cluster_detections = [det for i, det in enumerate(detections) if labels[i] == label]
+            
+            # Calculate average position for cluster
+            avg_x = np.mean([det['x'] for det in cluster_detections])
+            avg_y = np.mean([det['y'] for det in cluster_detections])
+            
+            clustered_obj = {
+                'x': avg_x,
+                'y': avg_y,
+                'detections': cluster_detections,
+                'n_detections': len(cluster_detections)
+            }
+            clustered_objects.append(clustered_obj)
+        
+        return clustered_objects
 
-
-# =============================================================================
-# Plate Solving
-# =============================================================================
 
 class PlateSolver:
-    """Determines celestial coordinates from image."""
-    
-    ASTROMETRY_NET_URL = "http://nova.astrometry.net/api"
-    
-    def __init__(self, api_key: Optional[str] = None, debug: bool = False):
-        self.api_key = api_key
-        self.debug = debug
-        self._session_key = None
-    
-    def solve_from_wcs(self, wcs: WCS, 
-                       pixel_coords: List[Tuple[float, float]]
-                      ) -> List[Tuple[float, float]]:
-        """Convert pixel coordinates to celestial using existing WCS."""
-        if wcs is None:
-            return []
-        
-        celestial_coords = []
-        for x, y in pixel_coords:
-            try:
-                sky = wcs.pixel_to_world(x, y)
-                celestial_coords.append((sky.ra.deg, sky.dec.deg))
-            except Exception:
-                celestial_coords.append((None, None))
-        
-        return celestial_coords
-    
-    def solve_online(self, image: NDArray,
-                     sources: List[DetectedSource],
-                     timeout: int = 300) -> Optional[WCS]:
-        """Solve plate using astrometry.net API."""
-        if not self.api_key:
-            logger.warning("No astrometry.net API key provided")
-            return None
-        
-        try:
-            # Login to get session
-            self._login()
-            
-            # Upload image
-            submission_id = self._upload_image(image)
-            
-            # Wait for solution
-            job_id = self._wait_for_submission(submission_id, timeout)
-            
-            if job_id:
-                wcs = self._get_solution(job_id)
-                return wcs
-            
-        except Exception as e:
-            logger.error(f"Online plate solving failed: {e}")
-        
-        return None
-    
-    def _login(self):
-        """Login to astrometry.net API."""
-        response = requests.post(
-            f"{self.ASTROMETRY_NET_URL}/login",
-            data={'request-json': json.dumps({'apikey': self.api_key})}
-        )
-        result = response.json()
-        if result.get('status') == 'success':
-            self._session_key = result['session']
-        else:
-            raise RuntimeError(f"API login failed: {result}")
-    
-    def _upload_image(self, image: NDArray) -> int:
-        """Upload image for solving."""
-        # Save as temporary FITS
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix='.fits', delete=False) as f:
-            hdu = fits.PrimaryHDU(image)
-            hdu.writeto(f.name, overwrite=True)
-            temp_path = f.name
-        
-        try:
-            with open(temp_path, 'rb') as f:
-                response = requests.post(
-                    f"{self.ASTROMETRY_NET_URL}/upload",
-                    files={'file': f},
-                    data={'request-json': json.dumps({
-                        'session': self._session_key,
-                        'allow_commercial_use': 'n',
-                        'allow_modifications': 'n'
-                    })}
-                )
-            result = response.json()
-            if result.get('status') == 'success':
-                return result['subid']
-            else:
-                raise RuntimeError(f"Upload failed: {result}")
-        finally:
-            os.unlink(temp_path)
-    
-    def _wait_for_submission(self, submission_id: int, timeout: int) -> Optional[int]:
-        """Wait for submission to be processed."""
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout:
-            response = requests.get(
-                f"{self.ASTROMETRY_NET_URL}/submissions/{submission_id}"
-            )
-            result = response.json()
-            
-            jobs = result.get('jobs', [])
-            if jobs:
-                job_id = jobs[0]
-                if job_id:
-                    # Check job status
-                    job_response = requests.get(
-                        f"{self.ASTROMETRY_NET_URL}/jobs/{job_id}"
-                    )
-                    job_result = job_response.json()
-                    
-                    if job_result.get('status') == 'success':
-                        return job_id
-                    elif job_result.get('status') == 'failure':
-                        logger.warning("Plate solving failed")
-                        return None
-            
-            time.sleep(5)
-        
-        logger.warning("Plate solving timed out")
-        return None
-    
-    def _get_solution(self, job_id: int) -> Optional[WCS]:
-        """Get WCS solution from completed job."""
-        response = requests.get(
-            f"{self.ASTROMETRY_NET_URL}/jobs/{job_id}/wcs_file"
-        )
-        
-        if response.status_code == 200:
-            # Parse WCS from returned FITS header
-            from io import BytesIO
-            with fits.open(BytesIO(response.content)) as hdul:
-                return WCS(hdul[0].header)
-        
-        return None
-
-
-# =============================================================================
-# Object Identification
-# =============================================================================
-
-class ObjectIdentifier:
-    """Identifies detected objects using astronomical databases."""
+    """Handles plate solving for coordinate determination."""
     
     def __init__(self, debug: bool = False):
         self.debug = debug
     
-    def identify(self, obj: MovingObject, 
-                 search_radius: float = 60.0) -> MovingObject:
-        """Try to identify a moving object using databases."""
-        if not obj.ra_positions or not obj.dec_positions:
-            return obj
-        
-        # Use middle position for search
-        mid_idx = len(obj.ra_positions) // 2
-        ra = obj.ra_positions[mid_idx]
-        dec = obj.dec_positions[mid_idx]
-        obs_time = obj.times[mid_idx]
-        
-        # Try JPL Horizons first
-        match = self._search_jpl_horizons(ra, dec, obs_time, search_radius)
-        
-        if match:
-            obj.matched_name = match.get('name')
-            obj.matched_designation = match.get('designation')
-            obj.is_known = True
-            obj.orbital_elements = match.get('orbital_elements')
-            return obj
-        
-        # Try Minor Planet Center
-        match = self._search_mpc(ra, dec, obs_time, search_radius)
-        
-        if match:
-            obj.matched_name = match.get('name')
-            obj.matched_designation = match.get('designation')
-            obj.is_known = True
-            return obj
-        
-        # No match found - potential new discovery
-        obj.is_known = False
-        return obj
-    
-    def _search_jpl_horizons(self, ra: float, dec: float,
-                              obs_time: datetime,
-                              radius: float) -> Optional[Dict]:
-        """Search JPL Horizons for known objects near position."""
-        try:
-            # Convert time to Horizons format
-            time_str = obs_time.strftime('%Y-%m-%d %H:%M')
-            
-            # This is a simplified search - real implementation would
-            # query the Small Body Database API
-            url = "https://ssd-api.jpl.nasa.gov/sbdb_query.api"
-            params = {
-                'fields': 'spkid,full_name,kind,e,a,i,om,w,ma,epoch',
-                'sb-kind': 'a',  # Asteroids
-                'limit': 10
-            }
-            
-            response = requests.get(url, params=params, timeout=30)
-            
-            if response.status_code == 200:
-                data = response.json()
-                # Check each object's ephemeris
-                # (Simplified - real version would compute ephemerides)
-                
-                if self.debug:
-                    logger.debug(f"JPL query returned {len(data.get('data', []))} objects")
-                
-                # For now, return None - real implementation needs ephemeris calculation
-                return None
-            
-        except Exception as e:
-            logger.warning(f"JPL Horizons search failed: {e}")
-        
-        return None
-    
-    def _search_mpc(self, ra: float, dec: float,
-                    obs_time: datetime,
-                    radius: float) -> Optional[Dict]:
-        """Search Minor Planet Center for known objects."""
-        try:
-            # Query MPC using astroquery
-            coord = SkyCoord(ra=ra*u.deg, dec=dec*u.deg)
-            
-            # Search for known objects at this position
-            result = MPC.query_object('minor_planet', 
-                                      target_type='asteroid',
-                                      get_query_payload=True)
-            
+    def solve_field(self, image_data: np.ndarray, metadata: Dict) -> Optional[WCS]:
+        """Solve the astrometric solution for an image."""
+        # If WCS already exists in metadata, use it
+        if 'wcs' in metadata and metadata['wcs'] is not None:
             if self.debug:
-                logger.debug(f"MPC query for RA={ra:.4f}, Dec={dec:.4f}")
-            
-            # For demonstration - real implementation would use
-            # the MPC's conesearch or ephemeris services
+                logger.debug("Using existing WCS solution")
+            return metadata['wcs']
+        
+        # Try to use astrometry.net for plate solving
+        try:
+            return self._solve_with_astrometry_net(image_data, metadata)
+        except Exception as e:
+            logger.warning(f"Plate solving failed: {e}")
             return None
-            
-        except Exception as e:
-            logger.warning(f"MPC search failed: {e}")
-        
+    
+    def _solve_with_astrometry_net(self, image_data: np.ndarray, metadata: Dict) -> Optional[WCS]:
+        """Solve using astrometry.net (requires astroquery and API key)."""
+        # This is a placeholder - actual implementation would require
+        # astrometry.net API integration or local installation
+        logger.warning("Astrometry.net integration not implemented in this example")
         return None
     
-    def check_known_object_at_position(self, ra: float, dec: float,
-                                        obs_time: datetime,
-                                        target_name: str) -> bool:
-        """Check if a specific known object is at the given position."""
+    def pixel_to_world(self, wcs: WCS, x: float, y: float) -> SkyCoord:
+        """Convert pixel coordinates to world coordinates."""
+        if wcs is None:
+            raise ValueError("No WCS solution available")
+        
+        world_coords = wcs.pixel_to_world(x, y)
+        return world_coords
+
+
+class ObjectIdentifier:
+    """Identifies objects using astronomical databases."""
+    
+    def __init__(self, debug: bool = False):
+        self.debug = debug
+    
+    def query_minor_planet_center(self, coord: SkyCoord, radius: float = 0.1) -> List[Dict]:
+        """Query Minor Planet Center for known objects."""
         try:
-            # Query Horizons for specific object
-            obj = Horizons(
-                id=target_name,
-                location='500',  # Geocentric
-                epochs=Time(obs_time).jd
-            )
+            # Query MPC for objects near the coordinates
+            result = MPC.query_region(coord, radius=radius * u.deg)
             
-            eph = obj.ephemerides()
+            objects = []
+            if result is not None:
+                for row in result:
+                    obj = {
+                        'name': row.get('name', 'Unknown'),
+                        'designation': row.get('designation', ''),
+                        'object_type': 'asteroid',
+                        'database': 'MPC',
+                        'separation': 0.0  # Would calculate actual separation
+                    }
+                    objects.append(obj)
             
-            if len(eph) > 0:
-                obj_ra = eph['RA'][0]
-                obj_dec = eph['DEC'][0]
-                
-                # Check if within 60 arcsec
-                sep = np.sqrt((ra - obj_ra)**2 + (dec - obj_dec)**2) * 3600
-                
-                return sep < 60
+            return objects
             
         except Exception as e:
-            if self.debug:
-                logger.debug(f"Horizons check for {target_name} failed: {e}")
+            logger.error(f"MPC query failed: {e}")
+            return []
+    
+    def query_jpl_horizons(self, coord: SkyCoord, obs_time: Time, radius: float = 0.1) -> List[Dict]:
+        """Query JPL Horizons for known objects."""
+        try:
+            # This would require more complex implementation
+            # to search for objects near given coordinates
+            logger.warning("JPL Horizons coordinate search not fully implemented")
+            return []
+            
+        except Exception as e:
+            logger.error(f"JPL Horizons query failed: {e}")
+            return []
+    
+    def identify_object(self, coord: SkyCoord, obs_time: Optional[Time] = None) -> Dict:
+        """Attempt to identify an object at given coordinates."""
+        identification = {
+            'coordinates': coord,
+            'known_objects': [],
+            'is_known': False,
+            'best_match': None
+        }
         
-        return False
+        # Query databases
+        mpc_results = self.query_minor_planet_center(coord)
+        identification['known_objects'].extend(mpc_results)
+        
+        if obs_time:
+            horizons_results = self.query_jpl_horizons(coord, obs_time)
+            identification['known_objects'].extend(horizons_results)
+        
+        if identification['known_objects']:
+            identification['is_known'] = True
+            identification['best_match'] = identification['known_objects'][0]
+        
+        return identification
 
-
-# =============================================================================
-# Main Detector Class
-# =============================================================================
 
 class AsteroidDetector:
-    """Main class for asteroid detection pipeline."""
+    """Main class coordinating the detection pipeline."""
     
-    def __init__(self, 
-                 debug: bool = False,
-                 verbose: bool = False,
-                 progress_mode: str = "tqdm",
-                 astrometry_api_key: Optional[str] = None):
-        """
-        Initialize the asteroid detector.
-        
-        Args:
-            debug: Enable debug logging
-            verbose: Enable verbose output
-            progress_mode: Progress display mode ("tqdm", "log", "callback", "none")
-            astrometry_api_key: API key for astrometry.net plate solving
-        """
+    def __init__(self, debug: bool = False, progress: bool = True):
         self.debug = debug
-        self.verbose = verbose
-        self.progress_mode = progress_mode
+        self.show_progress = progress
         
-        # Configure logging
-        if debug:
-            logging.getLogger().setLevel(logging.DEBUG)
-        elif verbose:
-            logging.getLogger().setLevel(logging.INFO)
+        self.image_processor = ImageProcessor(debug)
+        self.star_detector = StarDetector(debug)
+        self.motion_detector = MotionDetector(debug)
+        self.plate_solver = PlateSolver(debug)
+        self.object_identifier = ObjectIdentifier(debug)
         
-        # Initialize components
-        self.image_processor = ImageProcessor(debug=debug)
-        self.star_detector = StarDetector(debug=debug)
-        self.motion_detector = MotionDetector(debug=debug)
-        self.plate_solver = PlateSolver(api_key=astrometry_api_key, debug=debug)
-        self.object_identifier = ObjectIdentifier(debug=debug)
+        self.results = []
     
-    def detect(self, image_paths: List[Path],
-               detection_threshold: float = 3.0,
-               min_detections: int = 3) -> DetectionResult:
-        """
-        Run the complete detection pipeline on a set of images.
-        
-        Args:
-            image_paths: List of paths to image files
-            detection_threshold: Detection threshold in sigma
-            min_detections: Minimum detections required for confirmation
-            
-        Returns:
-            DetectionResult with all detected objects
-        """
-        start_time = time.time()
-        errors = []
-        warnings = []
+    def process_image_sequence(self, image_paths: List[Path]) -> Dict:
+        """Process a sequence of images to detect moving objects."""
+        if len(image_paths) < 2:
+            raise ValueError("Need at least 2 images for motion detection")
         
         logger.info(f"Processing {len(image_paths)} images")
         
-        # Step 1: Load and preprocess images
-        total_steps = len(image_paths) * 4 + 3  # Load, detect, align, motion, identify
+        # Load and preprocess images
+        image_data = []
         
-        with progress_context(total_steps, "Processing", self.progress_mode) as progress:
-            
-            images = []
-            metadata_list = []
-            sources_list = []
-            times = []
-            
-            # Load images
-            for i, path in enumerate(image_paths):
-                progress.update(0, f"Loading {path.name}")
-                
+        with tqdm(total=len(image_paths), desc="Loading images", 
+                 disable=not self.show_progress) as pbar:
+            for path in image_paths:
                 try:
-                    data, meta = self.image_processor.load_image(path)
-                    data = self.image_processor.preprocess(data)
-                    images.append(data)
-                    metadata_list.append(meta)
+                    data, metadata = self.image_processor.load_image(path)
+                    processed_data = self.image_processor.preprocess_image(data, metadata)
                     
-                    if meta.observation_time:
-                        times.append(meta.observation_time)
-                    else:
-                        # Estimate time from file modification
-                        times.append(datetime.fromtimestamp(path.stat().st_mtime))
+                    # Detect stars
+                    sources = self.star_detector.detect_stars(processed_data)
+                    
+                    image_data.append((processed_data, sources, metadata))
+                    pbar.update(1)
                     
                 except Exception as e:
-                    errors.append(f"Failed to load {path}: {e}")
-                    logger.error(f"Failed to load {path}: {e}")
-                
-                progress.update(1)
-            
-            if len(images) < 2:
-                raise ValueError("Need at least 2 valid images for detection")
-            
-            # Detect sources in each image
-            for i, (image, meta) in enumerate(zip(images, metadata_list)):
-                progress.update(0, f"Detecting sources in image {i+1}")
-                
-                try:
-                    sources = self.star_detector.detect(image, detection_threshold)
-                    
-                    # Add celestial coordinates if WCS available
-                    if meta.wcs is not None:
-                        for src in sources:
-                            coords = self.plate_solver.solve_from_wcs(
-                                meta.wcs, [(src.x, src.y)]
-                            )
-                            if coords and coords[0][0] is not None:
-                                src.ra, src.dec = coords[0]
-                    
-                    sources_list.append(sources)
-                    
-                except Exception as e:
-                    errors.append(f"Source detection failed for image {i}: {e}")
-                    sources_list.append([])
-                
-                progress.update(1)
-            
-            # Step 2: Detect motion
-            progress.update(0, "Analyzing motion")
-            
-            try:
-                self.motion_detector.min_detections = min_detections
-                moving_objects = self.motion_detector.detect_motion(
-                    images, sources_list, times
-                )
-            except Exception as e:
-                errors.append(f"Motion detection failed: {e}")
-                moving_objects = []
-            
-            progress.update(1)
-            
-            # Step 3: Add celestial coordinates to moving objects
-            progress.update(0, "Computing coordinates")
-            
-            for obj in moving_objects:
-                wcs = metadata_list[0].wcs
-                if wcs:
-                    coords = self.plate_solver.solve_from_wcs(wcs, obj.positions)
-                    obj.ra_positions = [c[0] for c in coords if c[0] is not None]
-                    obj.dec_positions = [c[1] for c in coords if c[1] is not None]
-            
-            progress.update(1)
-            
-            # Step 4: Identify objects
-            progress.update(0, "Identifying objects")
-            
-            potential_discoveries = []
-            known_objects = []
-            
-            for obj in moving_objects:
-                identified = self.object_identifier.identify(obj)
-                
-                if identified.is_known:
-                    known_objects.append(identified)
-                else:
-                    potential_discoveries.append(identified)
-            
-            progress.update(1)
+                    logger.error(f"Failed to process {path}: {e}")
+                    if self.debug:
+                        raise
+                    continue
         
-        processing_time = time.time() - start_time
+        if len(image_data) < 2:
+            raise RuntimeError("Not enough valid images processed")
         
-        logger.info(f"Detection complete in {processing_time:.1f}s")
-        logger.info(f"Found {len(moving_objects)} moving objects")
-        logger.info(f"  - Known objects: {len(known_objects)}")
-        logger.info(f"  - Potential discoveries: {len(potential_discoveries)}")
+        # Register images
+        logger.info("Registering images")
+        registered_images = self.motion_detector.register_images(image_data)
         
-        return DetectionResult(
-            input_files=[str(p) for p in image_paths],
-            processing_time=processing_time,
-            sources_per_image=[len(s) for s in sources_list],
-            moving_objects=moving_objects,
-            potential_discoveries=potential_discoveries,
-            known_objects=known_objects,
-            errors=errors,
-            warnings=warnings
-        )
+        # Detect moving objects
+        logger.info("Detecting moving objects")
+        source_tables = [item[1] for item in image_data]
+        moving_objects = self.motion_detector.detect_moving_objects(
+            registered_images, source_tables)
+        
+        # Plate solve and identify objects
+        results = []
+        wcs = None
+        
+        if moving_objects:
+            logger.info(f"Analyzing {len(moving_objects)} potential objects")
+            
+            # Get WCS solution from first image
+            wcs = self.plate_solver.solve_field(image_data[0][0], image_data[0][2])
+            
+            with tqdm(total=len(moving_objects), desc="Identifying objects",
+                     disable=not self.show_progress) as pbar:
+                for obj in moving_objects:
+                    result = self._analyze_object(obj, wcs, image_data[0][2])
+                    results.append(result)
+                    pbar.update(1)
+        
+        # Compile final results
+        summary = {
+            'n_images_processed': len(image_data),
+            'n_moving_objects_detected': len(moving_objects),
+            'n_identified_objects': sum(1 for r in results if r['identification']['is_known']),
+            'n_unknown_objects': sum(1 for r in results if not r['identification']['is_known']),
+            'wcs_available': wcs is not None,
+            'objects': results
+        }
+        
+        self.results = summary
+        return summary
     
-    def generate_report(self, result: DetectionResult, 
-                        output_path: Optional[Path] = None) -> str:
-        """Generate a markdown report from detection results."""
-        lines = [
-            "# Asteroid Detection Report",
+    def _analyze_object(self, obj: Dict, wcs: Optional[WCS], metadata: Dict) -> Dict:
+        """Analyze a detected moving object."""
+        result = {
+            'pixel_coordinates': (obj['x'], obj['y']),
+            'world_coordinates': None,
+            'identification': None,
+            'confidence': 'low',
+            'metadata': obj
+        }
+        
+        # Convert to world coordinates if possible
+        if wcs is not None:
+            try:
+                world_coord = self.plate_solver.pixel_to_world(wcs, obj['x'], obj['y'])
+                result['world_coordinates'] = world_coord
+                
+                # Attempt identification
+                obs_time = metadata.get('obs_time')
+                identification = self.object_identifier.identify_object(world_coord, obs_time)
+                result['identification'] = identification
+                
+                # Set confidence based on number of detections and identification
+                if obj.get('n_detections', 1) > 2:
+                    result['confidence'] = 'high' if identification['is_known'] else 'medium'
+                
+            except Exception as e:
+                logger.error(f"Failed to analyze object: {e}")
+                if self.debug:
+                    raise
+        
+        return result
+    
+    def save_results(self, output_path: Path):
+        """Save results to JSON file."""
+        if not self.results:
+            logger.warning("No results to save")
+            return
+        
+        # Convert results to JSON-serializable format
+        serializable_results = self._make_json_serializable(self.results)
+        
+        with open(output_path, 'w') as f:
+            json.dump(serializable_results, f, indent=2)
+        
+        logger.info(f"Results saved to {output_path}")
+    
+    def _make_json_serializable(self, obj):
+        """Convert objects to JSON-serializable format."""
+        if isinstance(obj, dict):
+            return {k: self._make_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._make_json_serializable(v) for v in obj]
+        elif hasattr(obj, 'to_string'):  # SkyCoord objects
+            return str(obj)
+        elif isinstance(obj, (np.integer, np.floating)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return obj
+    
+    def generate_report(self, output_path: Path):
+        """Generate a detailed analysis report."""
+        if not self.results:
+            logger.warning("No results available for report")
+            return
+        
+        report_lines = [
+            "# Astronomical Object Detection Report",
+            f"Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}",
             "",
-            f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"**Processing Time:** {result.processing_time:.2f} seconds",
+            "## Summary",
+            f"- Images processed: {self.results['n_images_processed']}",
+            f"- Moving objects detected: {self.results['n_moving_objects_detected']}",
+            f"- Known objects identified: {self.results['n_identified_objects']}",
+            f"- Unknown objects: {self.results['n_unknown_objects']}",
+            f"- Plate solving successful: {self.results['wcs_available']}",
             "",
-            "## Input Files",
-            ""
+            "## Detected Objects",
         ]
         
-        for f in result.input_files:
-            lines.append(f"- {f}")
-        
-        lines.extend([
-            "",
-            "## Detection Summary",
-            "",
-            f"- **Total Moving Objects:** {len(result.moving_objects)}",
-            f"- **Known Objects:** {len(result.known_objects)}",
-            f"- **Potential Discoveries:** {len(result.potential_discoveries)}",
-            ""
-        ])
-        
-        if result.potential_discoveries:
-            lines.extend([
-                "## Potential Discoveries",
-                "",
-                "| ID | Velocity (arcsec/hr) | Position Angle | Confidence |",
-                "|:---|:--------------------:|:--------------:|:----------:|"
+        for i, obj in enumerate(self.results['objects'], 1):
+            report_lines.extend([
+                f"### Object {i}",
+                f"- Pixel coordinates: ({obj['pixel_coordinates'][0]:.1f}, {obj['pixel_coordinates'][1]:.1f})",
+                f"- Confidence: {obj['confidence']}",
             ])
             
-            for obj in result.potential_discoveries:
-                lines.append(
-                    f"| {obj.id} | {obj.velocity_arcsec_per_hour:.2f} | "
-                    f"{obj.position_angle:.1f}° | {obj.confidence:.2%} |"
-                )
+            if obj['world_coordinates']:
+                report_lines.append(f"- Sky coordinates: {obj['world_coordinates']}")
             
-            lines.append("")
-        
-        if result.known_objects:
-            lines.extend([
-                "## Identified Known Objects",
-                "",
-                "| ID | Name/Designation | Velocity (arcsec/hr) |",
-                "|:---|:-----------------|:--------------------:|"
-            ])
+            if obj['identification']:
+                id_info = obj['identification']
+                if id_info['is_known']:
+                    best_match = id_info['best_match']
+                    report_lines.extend([
+                        f"- **IDENTIFIED**: {best_match['name']}",
+                        f"- Object type: {best_match['object_type']}",
+                        f"- Database: {best_match['database']}",
+                    ])
+                else:
+                    report_lines.append("- **UNKNOWN OBJECT** - Potential new discovery!")
             
-            for obj in result.known_objects:
-                name = obj.matched_name or obj.matched_designation or "Unknown"
-                lines.append(
-                    f"| {obj.id} | {name} | {obj.velocity_arcsec_per_hour:.2f} |"
-                )
-            
-            lines.append("")
+            report_lines.append("")
         
-        if result.errors:
-            lines.extend([
-                "## Errors",
-                ""
-            ])
-            for err in result.errors:
-                lines.append(f"- {err}")
-            lines.append("")
+        with open(output_path, 'w') as f:
+            f.write('\n'.join(report_lines))
         
-        if result.warnings:
-            lines.extend([
-                "## Warnings",
-                ""
-            ])
-            for warn in result.warnings:
-                lines.append(f"- {warn}")
-        
-        report = "\n".join(lines)
-        
-        if output_path:
-            output_path.write_text(report)
-            logger.info(f"Report saved to {output_path}")
-        
-        return report
+        logger.info(f"Report saved to {output_path}")
 
-
-# =============================================================================
-# CLI Entry Point
-# =============================================================================
 
 def main():
-    """Command-line interface for asteroid detection."""
+    """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Detect moving objects (asteroids, comets) in astronomical images",
+        description="Detect moving objects in astronomical image sequences",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic detection with progress bar
-  python asteroid_detector.py image1.fits image2.fits image3.fits
-
-  # Detection with debug output
-  python asteroid_detector.py --debug -v *.fits
-
-  # Output results to JSON
-  python asteroid_detector.py --output results.json --format json *.fits
-
-  # Generate markdown report
-  python asteroid_detector.py --output report.md --format markdown *.fits
-
-Supported formats: FITS, TIFF, JPEG, XISF
+  %(prog)s images/*.fits
+  %(prog)s --debug --output results.json image1.jpg image2.jpg image3.jpg
+  %(prog)s --no-progress --threshold 3.0 *.tiff
         """
     )
     
-    parser.add_argument(
-        "images",
-        nargs="+",
-        type=Path,
-        help="Input image files (at least 2 required)"
-    )
-    
-    parser.add_argument(
-        "-o", "--output",
-        type=Path,
-        help="Output file for results (default: stdout)"
-    )
-    
-    parser.add_argument(
-        "-f", "--format",
-        choices=["json", "markdown", "text"],
-        default="text",
-        help="Output format (default: text)"
-    )
-    
-    parser.add_argument(
-        "-t", "--threshold",
-        type=float,
-        default=3.0,
-        help="Detection threshold in sigma (default: 3.0)"
-    )
-    
-    parser.add_argument(
-        "-m", "--min-detections",
-        type=int,
-        default=3,
-        help="Minimum detections to confirm object (default: 3)"
-    )
-    
-    parser.add_argument(
-        "--astrometry-key",
-        type=str,
-        help="API key for astrometry.net plate solving"
-    )
-    
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable verbose output"
-    )
-    
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug mode with detailed logging"
-    )
-    
-    parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Disable progress bar"
-    )
-    
-    parser.add_argument(
-        "--log-file",
-        type=Path,
-        help="Write logs to file"
-    )
+    parser.add_argument('images', nargs='+', help='Input image files')
+    parser.add_argument('--output', '-o', type=Path, default='detection_results.json',
+                       help='Output JSON file (default: detection_results.json)')
+    parser.add_argument('--report', '-r', type=Path, default='detection_report.md',
+                       help='Output report file (default: detection_report.md)')
+    parser.add_argument('--threshold', '-t', type=float, default=5.0,
+                       help='Detection threshold (default: 5.0)')
+    parser.add_argument('--debug', '-d', action='store_true',
+                       help='Enable debug output')
+    parser.add_argument('--no-progress', action='store_true',
+                       help='Disable progress bars')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Verbose logging')
     
     args = parser.parse_args()
     
     # Configure logging
-    log_level = logging.DEBUG if args.debug else (logging.INFO if args.verbose else logging.WARNING)
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    elif args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
     
-    handlers = [logging.StreamHandler()]
-    if args.log_file:
-        handlers.append(logging.FileHandler(args.log_file))
+    # Convert image paths
+    image_paths = [Path(p) for p in args.images]
     
-    logging.basicConfig(
-        level=log_level,
-        format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-        handlers=handlers
-    )
+    # Validate input files
+    for path in image_paths:
+        if not path.exists():
+            logger.error(f"File not found: {path}")
+            sys.exit(1)
     
-    # Validate inputs
-    if len(args.images) < 2:
-        parser.error("At least 2 images are required for motion detection")
-    
-    for img in args.images:
-        if not img.exists():
-            parser.error(f"Image file not found: {img}")
-    
-    # Initialize detector
-    progress_mode = "none" if args.no_progress else "tqdm"
-    
-    detector = AsteroidDetector(
-        debug=args.debug,
-        verbose=args.verbose,
-        progress_mode=progress_mode,
-        astrometry_api_key=args.astrometry_key
-    )
-    
-    # Run detection
     try:
-        result = detector.detect(
-            args.images,
-            detection_threshold=args.threshold,
-            min_detections=args.min_detections
-        )
+        # Create detector
+        detector = AsteroidDetector(debug=args.debug, progress=not args.no_progress)
         
-        # Format output
-        if args.format == "json":
-            output = json.dumps({
-                'input_files': result.input_files,
-                'processing_time': result.processing_time,
-                'sources_per_image': result.sources_per_image,
-                'moving_objects': [
-                    {
-                        'id': obj.id,
-                        'velocity_arcsec_per_hour': obj.velocity_arcsec_per_hour,
-                        'position_angle': obj.position_angle,
-                        'confidence': obj.confidence,
-                        'is_known': obj.is_known,
-                        'matched_name': obj.matched_name,
-                        'positions': obj.positions,
-                        'ra_positions': obj.ra_positions,
-                        'dec_positions': obj.dec_positions
-                    }
-                    for obj in result.moving_objects
-                ],
-                'errors': result.errors,
-                'warnings': result.warnings
-            }, indent=2)
+        # Process images
+        results = detector.process_image_sequence(image_paths)
         
-        elif args.format == "markdown":
-            output = detector.generate_report(result)
+        # Save results
+        detector.save_results(args.output)
+        detector.generate_report(args.report)
         
-        else:  # text
-            lines = [
-                f"Asteroid Detection Results",
-                f"==========================",
-                f"Processed {len(result.input_files)} images in {result.processing_time:.2f}s",
-                f"",
-                f"Moving Objects Found: {len(result.moving_objects)}",
-                f"  - Known: {len(result.known_objects)}",
-                f"  - Potential Discoveries: {len(result.potential_discoveries)}",
-                ""
-            ]
-            
-            for obj in result.moving_objects:
-                status = "KNOWN" if obj.is_known else "POTENTIAL DISCOVERY"
-                name = obj.matched_name or obj.matched_designation or "Unknown"
-                lines.append(
-                    f"  {obj.id}: {status} - {name if obj.is_known else ''}"
-                    f" v={obj.velocity_arcsec_per_hour:.2f}\"/hr "
-                    f"PA={obj.position_angle:.1f}° "
-                    f"conf={obj.confidence:.0%}"
-                )
-            
-            if result.errors:
-                lines.extend(["", "Errors:"] + [f"  - {e}" for e in result.errors])
-            
-            output = "\n".join(lines)
+        # Print summary
+        print(f"\n=== Detection Summary ===")
+        print(f"Images processed: {results['n_images_processed']}")
+        print(f"Moving objects detected: {results['n_moving_objects_detected']}")
+        print(f"Known objects identified: {results['n_identified_objects']}")
+        print(f"Unknown objects: {results['n_unknown_objects']}")
         
-        # Write output
-        if args.output:
-            args.output.write_text(output)
-            print(f"Results written to {args.output}")
-        else:
-            print(output)
+        if results['n_unknown_objects'] > 0:
+            print(f"\n🎉 Found {results['n_unknown_objects']} potential new discoveries!")
         
-        # Exit with error code if there were errors
-        sys.exit(1 if result.errors else 0)
+        print(f"\nResults saved to: {args.output}")
+        print(f"Report saved to: {args.report}")
         
     except Exception as e:
-        logger.exception(f"Detection failed: {e}")
+        logger.error(f"Detection failed: {e}")
+        if args.debug:
+            raise
         sys.exit(1)
 
 
