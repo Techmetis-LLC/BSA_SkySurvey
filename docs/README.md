@@ -1,6 +1,6 @@
-# Asteroid Detection Platform
+# Welcome to the Bortle Combat Astro Sky Survey
 
-A comprehensive system for detecting moving objects (asteroids, comets) in astronomical image sequences. The platform identifies objects that move differently from the stellar background, performs plate solving for celestial coordinates, and queries NASA/Minor Planet Center databases to identify known objects or flag potential new discoveries.
+A comprehensive system for detecting moving objects (asteroids, comets) in astronomical image sequences. The platform identifies objects that move differently from the stellar background, performs plate solving for celestial coordinates, and queries NASA/Minor Planet Center and SkyBot databases to identify known objects or flag potential new discoveries.
 
 ## Table of Contents
 
